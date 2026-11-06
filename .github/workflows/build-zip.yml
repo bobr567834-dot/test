@@ -1,0 +1,116 @@
+name: Сборка IPA из архива
+
+on:
+  push:
+    paths:
+      - 'inbox/**'
+  workflow_dispatch:
+    inputs:
+      zip:
+        description: 'Путь к архиву в репозитории (inbox/...)'
+        required: false
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - name: Загрузка репозитория
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Поиск архива
+        id: locate
+        env:
+          INPUT_ZIP: ${{ github.event.inputs.zip }}
+        run: |
+          ZIP="$INPUT_ZIP"
+          if [ -z "$ZIP" ]; then
+            ZIP=$(git diff --name-only --diff-filter=AM HEAD~1 HEAD -- 'inbox/*.zip' | head -n 1)
+          fi
+          if [ -z "$ZIP" ] || [ ! -f "$ZIP" ]; then
+            echo "error: архив не найден в inbox/"
+            exit 1
+          fi
+          echo "zip=$ZIP" >> "$GITHUB_OUTPUT"
+
+      - name: Распаковка
+        id: unpack
+        run: |
+          mkdir -p work
+          unzip -q "${{ steps.locate.outputs.zip }}" -d work
+          YML=$(find work -maxdepth 3 -name project.yml | head -n 1)
+          if [ -n "$YML" ]; then
+            DIR=$(dirname "$YML")
+            echo "yml=true" >> "$GITHUB_OUTPUT"
+          else
+            XP=$(find work -maxdepth 3 -name '*.xcodeproj' | head -n 1)
+            if [ -z "$XP" ]; then
+              echo "error: в архиве нет project.yml и .xcodeproj"
+              exit 1
+            fi
+            DIR=$(dirname "$XP")
+            echo "yml=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo "dir=$DIR" >> "$GITHUB_OUTPUT"
+          if [ -n "$YML" ] && grep -qi 'platform: *watchOS' "$YML"; then
+            echo "platform=watchOS" >> "$GITHUB_OUTPUT"
+          else
+            echo "platform=iOS" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Установка XcodeGen
+        if: steps.unpack.outputs.yml == 'true'
+        run: brew install xcodegen
+
+      - name: Версия Xcode
+        run: xcodebuild -version
+
+      - name: Генерация проекта
+        if: steps.unpack.outputs.yml == 'true'
+        working-directory: ${{ steps.unpack.outputs.dir }}
+        run: xcodegen generate
+
+      - name: Сборка
+        working-directory: ${{ steps.unpack.outputs.dir }}
+        run: |
+          set -o pipefail
+          XP=$(find . -maxdepth 1 -name '*.xcodeproj' | head -n 1)
+          if [ -z "$XP" ]; then
+            echo "error: .xcodeproj не найден"
+            exit 1
+          fi
+          SCHEME=$(xcodebuild -list -json -project "$XP" | python3 -c "import json,sys; print(json.load(sys.stdin)['project']['schemes'][0])")
+          echo "Схема: $SCHEME"
+          xcodebuild -project "$XP" -scheme "$SCHEME" -configuration Release \
+            -destination "generic/platform=${{ steps.unpack.outputs.platform }}" \
+            -derivedDataPath build CODE_SIGNING_ALLOWED=NO clean build
+
+      - name: Упаковка IPA
+        id: package
+        working-directory: ${{ steps.unpack.outputs.dir }}
+        run: |
+          APP=$(find build/Build/Products -maxdepth 2 -name '*.app' | head -n 1)
+          if [ -z "$APP" ]; then
+            echo "error: .app не найден после сборки"
+            exit 1
+          fi
+          NAME=$(basename "$APP" .app)
+          rm -rf Payload
+          mkdir Payload
+          cp -R "$APP" Payload/
+          zip -qr "$NAME.ipa" Payload
+          echo "ipa=$PWD/$NAME.ipa" >> "$GITHUB_OUTPUT"
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+
+      - name: Публикация IPA
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "build-${{ github.run_id }}" "${{ steps.package.outputs.ipa }}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "${{ steps.package.outputs.name }} #${{ github.run_number }}" \
+            --notes "Собрано из ${{ steps.locate.outputs.zip }}"
